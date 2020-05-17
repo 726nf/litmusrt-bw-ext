@@ -15,7 +15,6 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 
-//#include <litmus/debug_trace.h>
 #include <litmus/litmus.h>
 #include <litmus/jobs.h>
 #include <litmus/sched_plugin.h>
@@ -132,15 +131,13 @@ static rt_domain_t gsnedfbw;
 #define gsnedfbw_lock (gsnedfbw.ready_lock)
 #define gsnedfbw_bw_lock (gsnedfbw.bw_lock)
 
-//static struct task_struct standby_tasks;
-//static cpu_entry_t* standby_cpus[NR_CPUS];
-struct task_struct standby_tasks;
-cpu_entry_t* standby_cpus[NR_CPUS];
+static struct task_struct standby_tasks;
+static cpu_entry_t* standby_cpus[NR_CPUS];
 
 /* Uncomment this if you want to see all scheduling decisions in the
  * TRACE() log.
 */
-#define WANT_ALL_SCHED_EVENTS
+//#define WANT_ALL_SCHED_EVENTS
 
 static int cpu_lower_prio(struct bheap_node *_a, struct bheap_node *_b)
 {
@@ -242,8 +239,15 @@ static noinline void unlink(struct task_struct* t)
 	if (t->rt_param.linked_on != NO_CPU) {
 		/* unlink */
 		entry = &per_cpu(gsnedfbw_cpu_entries, t->rt_param.linked_on);
+
+		raw_spin_lock(&gsnedfbw_bw_lock);
+		unlock_bw_partitions(entry->cpu, tsk_rt(t)->job_params.bw_partitions, &gsnedfbw);
+		tsk_rt(t)->job_params.bw_partitions = 0;
+		raw_spin_unlock(&gsnedfbw_bw_lock);
+
 		t->rt_param.linked_on = NO_CPU;
 		link_task_to_cpu(NULL, entry);
+
 	} else if (is_queued(t)) {
 		/* This is an interesting situation: t is scheduled,
 		 * but was just recently unlinked.  It cannot be
@@ -298,367 +302,271 @@ static cpu_entry_t* gsnedfbw_get_nearest_available_cpu(cpu_entry_t *start)
 }
 #endif
 
-/* Check if top task in ready_queue can preempt a CPU
- * Remove the top task from ready_queue if preemption occurs  */
-static inline int check_for_preemptions_helper(void)
+static int check_for_bw_preemptions(cpu_entry_t *entry, struct task_struct *task)
 {
-	rt_domain_t *rt = &gsnedfbw;
-	struct task_struct *task;
 	int num_used_bw_partitions = 0;
-	int cpu_ok = 0, bw_ok = 0;
-	int only_take_idle_bw = 0;
-	uint32_t bw_mask_to_use = 0; /* mask of cache partitions the task to use */
 	int num_bw_to_use = 0;
-	struct task_struct preempted_tasks;
-	cpu_entry_t *cpu_to_preempt = NULL;
-	int i;
+	int bw_ok = 0, i, cpu = 0;
+	uint32_t bw_mask_to_use = 0;
+	rt_domain_t *rt = &gsnedfbw;
 	struct list_head *iter, *tmp;
-	int has_preemption = SCHED_NO_PREEMPTION;
-//	cpu_entry_t* entry;
+	cpu_entry_t *last;
+	struct task_struct *cur;
 
-	INIT_LIST_HEAD(&tsk_rt(&preempted_tasks)->standby_list);
-
-	/*TODO: Assume no priority inversion first! */
-	task = __peek_ready(&gsnedfbw);
-
-	if (!task) {
-		TRACE_TASK(task, "No ready RT tasks\n");
-		goto out;
-	}
-
-	TRACE_TASK(task, "check_for_preemptions...\n");
-
-	/* Check if all cores are busy with high tasks 
-	 * No need to check any other tasks if no idle core */
-//	entry = lowest_prio_cpu();
-//	if (entry->linked && !edf_higher_prio(task, entry->linked))
-//	{
-//		has_preemption = SCHED_NO_LOW_PRIO_CORE;
-//		TRACE_TASK(task, "No lower priority CPU to preempt\n");
-//		goto out;
-//	}
-
-	/* Check if local cpu is idle first */
-	cpu_to_preempt = this_cpu_ptr(&gsnedfbw_cpu_entries);
-    BUG_ON(!cpu_to_preempt);
-
-	if (task && !cpu_to_preempt->linked) {
-		cpu_ok = 1;
-		//cpu_to_preempt = cpu_to_preempt;
-		TRACE_TASK(task, "linking to local CPU %d to avoid IPI if bandwidth is enough\n", cpu_to_preempt->cpu);
-	}
-	
-	/* Check if bandwidth and cpu is both available */
+	INIT_LIST_HEAD(&tsk_rt(&standby_tasks)->standby_list);
 	num_used_bw_partitions = count_set_bits(rt->used_bw_partitions & BANDWIDTH_PARTITIONS_MASK);
-	TRACE_TASK(task, "Attempt to preempt, num_used_bw_partitions=%d, used_bw_mask=0x%x, task.num_bw=%d\n",
-			   num_used_bw_partitions, rt->used_bw_partitions, tsk_rt(task)->task_params.num_bw_partitions);
-	if (MAX_NUM_BANDWIDTH_PARTITIONS - num_used_bw_partitions >= tsk_rt(task)->task_params.num_bw_partitions)
+
+	if (MAX_NUM_BANDWIDTH_PARTITIONS - num_used_bw_partitions
+			>= tsk_rt(task)->task_params.num_bw_partitions)
 	{
-		cpu_entry_t * entry = NULL;
-		struct task_struct* cur = NULL;
-		/* Enough idle cache partitions */
 		bw_ok = 1;
-		only_take_idle_bw = 1;
-		bw_mask_to_use = 0;
-		for(i = 0; i < MAX_NUM_BANDWIDTH_PARTITIONS; i++)
+		for (i = 0; i < MAX_NUM_BANDWIDTH_PARTITIONS; i++)
 		{
 			if (num_bw_to_use >= tsk_rt(task)->task_params.num_bw_partitions)
 				break;
 			if (!(rt->used_bw_partitions & (1<<i) & BANDWIDTH_PARTITIONS_MASK))
 			{
 				if (bw_mask_to_use & (1<<i) & BANDWIDTH_PARTITIONS_MASK)
-					TRACE_TASK(task, "[BUG] bw_mask_to_use=0x%x double set i=%d\n", bw_mask_to_use, i);
+					TRACE_TASK(task, "bw_mask_to_use=0x%x double set i=%d\n",
+							   bw_mask_to_use, i);
 				bw_mask_to_use |= (1<<i) & BANDWIDTH_PARTITIONS_MASK;
-				++num_bw_to_use;
+				num_bw_to_use++;
 			}
 		}
-		/* Find the lowest priority CPU to preempt */
-		entry = lowest_prio_cpu();
-		cur = entry->linked;
 
-		if (!cur || !is_realtime(cur) || edf_higher_prio(task, cur))
-		{
-			if (!cpu_ok)
-			{
-				cpu_ok = 1;
-				cpu_to_preempt = entry;
-				entry->preempting = task;
-			}
-		}
-		TRACE_TASK(task, "Enough idle bw, bw_ok=%d, cpu_ok=%d, bw_mask_to_use=0x%x, cpu_to_preempt=%d\n",
-				   bw_ok, cpu_ok, bw_mask_to_use, cpu_to_preempt->cpu);
-	} else
+		TRACE_TASK(task, "Enough idle bandwidth, bw_ok=%d, bw_mask_to_use=0x%x, cpu=%d\n",
+				bw_ok, bw_mask_to_use, entry->cpu);
+	}else
 	{
-		int cpu = 0;
+		bw_ok = 0;
 
-		BUG_ON(num_bw_to_use);
-		/* take idle cache partitions first */
-		for(i = 0; i < MAX_NUM_BANDWIDTH_PARTITIONS; i++)
+		//BUG_ON(num_bw_to_use);
+
+		if (num_bw_to_use) {
+			TRACE("[BUG] trying to preempt bandwidth but has num_bw_to_use=%d\n");
+		}
+
+		/* take idle bandwidth partitions first */
+		for (i = 0; i < MAX_NUM_BANDWIDTH_PARTITIONS; i++)
 		{
 			if (num_bw_to_use >= tsk_rt(task)->task_params.num_bw_partitions)
-			{
-				TRACE_TASK(task, "[BUG] Idle bandwidth is enough but still try to preempt bandwidth.\n");
 				break;
-			}
 			if (!(rt->used_bw_partitions & (1<<i) & BANDWIDTH_PARTITIONS_MASK))
 			{
 				if (bw_mask_to_use & (1<<i) & BANDWIDTH_PARTITIONS_MASK)
-					TRACE_TASK(task, "bw_mask_to_use=0x%x double set i=%d\n", bw_mask_to_use, i);
+					TRACE_TASK(task, "bw_mask_to_use=0x%x double set i=%d\n",
+							   bw_mask_to_use, i);
 				bw_mask_to_use |= (1<<i) & BANDWIDTH_PARTITIONS_MASK;
-				++num_bw_to_use;
+				num_bw_to_use++;
 			}
 		}
-		TRACE_TASK(task, "take idle bw_mask 0x%x\n", bw_mask_to_use);
+		TRACE_TASK(task, "take idle bandwidth 0x%x, num_bw_to_use=%d\n", bw_mask_to_use, num_bw_to_use);
 
-		if (num_bw_to_use >= tsk_rt(task)->task_params.num_bw_partitions)
+		for (last = lowest_prio_cpu(); last; last = lowest_prio_cpu())
 		{
-			/* TRACE BUG*/
-			TRACE_TASK(task, "[BUG] num_bw_to_use=%d >= task.num_bw=%d\n", 
-				num_bw_to_use, tsk_rt(task)->task_params.num_bw_partitions);
-		}
-
-		do { /* Iterate all CPUs in increasing order */
-			cpu_entry_t* entry = lowest_prio_cpu();
-			struct task_struct* cur;
-
-			if (!entry)
-				break;
-			/* We should use linked here since linked is who should run here.
- 			 * linked may != scheduled */
-			cur = entry->linked;
-			standby_cpus[entry->cpu] = entry;
-			remove_cpu(entry);
-
-			if (!cur || !is_realtime(cur))
-			{
-				if (!cpu_ok)
-				{
-					cpu_ok = 1;
-					cpu_to_preempt = entry;
-				}
-				cpu++;
-				continue;
-			}
-
-			/* RT task may have not locked any bw partition */
-			if (tsk_rt(cur)->job_params.bw_partitions == 0)
-			{
-				cpu++;
-				TRACE_TASK(cur, "[BUG] was linked but is not using any bandwidth partitions.\n");
-				continue;
-			}
+			cur = last->linked;
 
 			if (!edf_higher_prio(task, cur))
 				break;
-			
-			if (!cpu_ok)
-			{
-				cpu_ok = 1;
-				cpu_to_preempt = entry;
-			}
 
-//			if (!list_empty(&tsk_rt(cur)->standby_list))
-//				TRACE_TASK(cur, "[BUG] going to have corrupted standby_list\n");
-
-			list_add(&tsk_rt(cur)->standby_list, &tsk_rt(&preempted_tasks)->standby_list);
-
-			if(count_set_bits(tsk_rt(cur)->job_params.bw_partitions) != tsk_rt(cur)->task_params.num_bw_partitions)
-			{
-				TRACE_TASK(cur, "[BUG] job=%d, job.bw_mask=0x%x, count_set_bits=%d, task.num_bw=%d, rt.used_bw_mask=0x%x\n",
-						   tsk_rt(cur)->job_params.job_no,
-						   tsk_rt(cur)->job_params.bw_partitions,
-						   count_set_bits(tsk_rt(cur)->job_params.bw_partitions),
-						   tsk_rt(cur)->task_params.num_bw_partitions,
-						   rt->used_bw_partitions);
-			}
+			standby_cpus[last->cpu] = last;
+			remove_cpu(last);
+			list_add(&tsk_rt(cur)->standby_list, &tsk_rt(&standby_tasks)->standby_list);
 
 			num_bw_to_use += tsk_rt(cur)->task_params.num_bw_partitions;
-			if (num_bw_to_use <= tsk_rt(task)->task_params.num_bw_partitions) {
+			if (num_bw_to_use <= tsk_rt(task)->task_params.num_bw_partitions)
+			{
 				if (bw_mask_to_use & tsk_rt(cur)->job_params.bw_partitions)
-				{
-					TRACE_TASK(task, "[BUG] preempt %s/%d/%d bandwidth 0x%x but already has bandwidth 0x%x\n",
-				   			   cur->comm, cur->pid, tsk_rt(cur)->job_params.job_no,
-							   tsk_rt(cur)->job_params.bw_partitions,
-							   bw_mask_to_use);
-				}
+					TRACE_TASK(task, "[BUG] preempt %s/%d/%d bw 0x%x but already has bw 0x%x\n",
+							   cur->comm, cur->pid, tsk_rt(cur)->job_params.job_no,
+							   tsk_rt(cur)->job_params.bw_partitions, bw_mask_to_use);
 				bw_mask_to_use |= tsk_rt(cur)->job_params.bw_partitions;
-			} else {
+			} else
+			{
 				num_bw_to_use -= tsk_rt(cur)->task_params.num_bw_partitions;
-				for(i = 0; i < MAX_NUM_BANDWIDTH_PARTITIONS; i++)
+
+				for (i = 0; i < MAX_NUM_BANDWIDTH_PARTITIONS; i++)
 				{
 					if (tsk_rt(cur)->job_params.bw_partitions & (1<<i))
 					{
 						if (num_bw_to_use >= tsk_rt(task)->task_params.num_bw_partitions)
 							break;
 						if (bw_mask_to_use & (1<<i))
-						{
 							TRACE_TASK(task, "[BUG] preempt %s/%d/%d bw 0x%x (i=%d) but already has bw 0x%x\n",
-									   cur->comm, cur->pid, tsk_rt(cur)->job_params.job_no,
-									   tsk_rt(cur)->job_params.bw_partitions, i,
-									   bw_mask_to_use);
-						}
-						++num_bw_to_use;
+							   cur->comm, cur->pid, tsk_rt(cur)->job_params.job_no,
+							   tsk_rt(cur)->job_params.bw_partitions, i, bw_mask_to_use);
 						bw_mask_to_use |= (1<<i);
+						num_bw_to_use++;
 					}
 				}
 			}
-			TRACE_TASK(task, "preempt %s/%d/%d, bw_mask_to_use=0x%x\n",
-					   cur->comm, cur->pid, tsk_rt(cur)->job_params.job_no, bw_mask_to_use);
-			/* Stop searching preempted bandwidth when we find enough */
+
 			if (num_bw_to_use >= tsk_rt(task)->task_params.num_bw_partitions)
 				break;
-			cpu++;
-		} while (cpu < NR_CPUS);
+		}
+
+//		do {
+//			cpu_entry_t *last = lowest_prio_cpu();
+//			struct task_struct *cur;
+//
+//			cpu++;
+//
+//			if (!last)
+//				break;
+//
+//			cur = last->linked;
+//
+//			if (!edf_higher_prio(task, cur))
+//				break;
+//
+//			standby_cpus[last->cpu] = last;
+//			remove_cpu(last);
+//			list_add(&tsk_rt(cur)->standby_list, &tsk_rt(&standby_tasks)->standby_list);
+//
+//			num_bw_to_use += tsk_rt(cur)->task_params.num_bw_partitions;
+//			if (num_bw_to_use <= tsk_rt(task)->task_params.num_bw_partitions)
+//			{
+//				if (bw_mask_to_use & tsk_rt(cur)->job_params.bw_partitions)
+//					TRACE_TASK(task, "[BUG] preempt %s/%d/%d bw 0x%x but already has bw 0x%x\n",
+//				   			   cur->comm, cur->pid, tsk_rt(cur)->job_params.job_no,
+//							   tsk_rt(cur)->job_params.bw_partitions, bw_mask_to_use);
+//				bw_mask_to_use |= tsk_rt(cur)->job_params.bw_partitions;
+//			} else
+//			{
+//				num_bw_to_use -= tsk_rt(cur)->task_params.num_bw_partitions;
+//
+//				for (i = 0; i < MAX_NUM_BANDWIDTH_PARTITIONS; i++)
+//				{
+//					if (tsk_rt(cur)->job_params.bw_partitions & (1<<i))
+//					{
+//						if (num_bw_to_use >= tsk_rt(task)->task_params.num_bw_partitions)
+//							break;
+//						if (bw_mask_to_use & (1<<i))
+//							TRACE_TASK(task, "[BUG] preempt %s/%d/%d bw 0x%x (i=%d) but already has bw 0x%x\n",
+//							   cur->comm, cur->pid, tsk_rt(cur)->job_params.job_no,
+//							   tsk_rt(cur)->job_params.bw_partitions, i, bw_mask_to_use);
+//						bw_mask_to_use |= (1<<i);
+//						num_bw_to_use++;
+//					}
+//				}
+//			}
+//
+//			if (num_bw_to_use >= tsk_rt(task)->task_params.num_bw_partitions)
+//				break;
+//
+//		}while (cpu <= NR_CPUS);
+
 		if (num_bw_to_use >= tsk_rt(task)->task_params.num_bw_partitions)
-			bw_ok = 1;
-		else 
 		{
-			/* clear preempted list if not preempt */
-		//	struct list_head *iter, *tmp;
-			bw_ok = 0;
-			list_for_each_safe(iter, tmp, &tsk_rt(&preempted_tasks)->standby_list) {
-				list_del_init(iter);
+			bw_ok = 1;
+			list_for_each_safe(iter, tmp, &tsk_rt(&standby_tasks)->standby_list) {
+				struct rt_param *rt_cur = list_entry(iter, struct rt_param, standby_list);
+				struct task_struct *tsk_cur = list_entry(rt_cur, struct task_struct, rt_param);
+				cpu_entry_t *cpu_entry = gsnedfbw_cpus[rt_cur->linked_on];
+				list_del_init(&rt_cur->standby_list);
+//				if (cpu_entry->cpu != entry->cpu)
+//				{
+					raw_spin_lock(&gsnedfbw_bw_lock);
+					unlock_bw_partitions(cpu_entry->cpu, tsk_rt(tsk_cur)->job_params.bw_partitions, &gsnedfbw);
+					tsk_rt(cpu_entry->linked)->job_params.bw_partitions = 0;
+					raw_spin_unlock(&gsnedfbw_bw_lock);
+
+					/* requeue the linked task; scheduled task is requeued at schedule() */
+					if (requeue_preempted_job(cpu_entry->linked))
+						requeue(cpu_entry->linked);
+					link_task_to_cpu(NULL, cpu_entry);
+					cpu_entry->preempting = task;
+//				}
 			}
+			TRACE_TASK(task, "Enough idle bandwidth through preemption, bw_ok=%d, bw_mask_to_use=0x%x, cpu=%d\n",
+					bw_ok, bw_mask_to_use, entry->cpu);
+			INIT_LIST_HEAD(&tsk_rt(&standby_tasks)->standby_list);
 		}
-		/* restore the cpu bheap */
-		for (cpu = 0; cpu < NR_CPUS; cpu++)  {
+
+		for_each_online_cpu(cpu)
+		{
 			if (standby_cpus[cpu] != NULL)
-				bheap_insert(cpu_lower_prio, &gsnedfbw_cpu_heap, standby_cpus[cpu]->hn);
-				//insert_cpu(standby_cpus[cpu]);
+				update_cpu_position(standby_cpus[cpu]);
 		}
+
 		memset(&standby_cpus, 0, sizeof(standby_cpus));
-	} /* Have picked bandwidth partitions */
-
-	/* If preemptable, link task to cpu_to_preempt, preempt preempted_tasks*/
-	if (!bw_ok || !cpu_ok)
-	{
-		TRACE_TASK(task, "Cannot preempt, bw_ok=%d, cpu_ok=%d, rt.used_bw_mask=0x%x, need %d bandwidth partitions\n",
-				   bw_ok, cpu_ok, rt->used_bw_partitions, tsk_rt(task)->task_params.num_bw_partitions);
-		has_preemption = SCHED_NO_PREEMPTION;
-		goto out;
-	}
-	/* Preempt preempted tasks */
-	BUG_ON(!cpu_to_preempt);
-	/* Must take_ready before we requeue any task */
-	has_preemption = SCHED_HAS_PREEMPTION;
-	task = __take_ready(&gsnedfbw);
-	BUG_ON(!task);
-
-	if (!only_take_idle_bw)
-	{
-		list_for_each_safe(iter, tmp, &tsk_rt(&preempted_tasks)->standby_list) {
-			struct rt_param *rt_cur = list_entry(iter, struct rt_param, standby_list);
-			struct task_struct *tsk_cur = list_entry(rt_cur, struct task_struct, rt_param); /* correct */
-			cpu_entry_t *cpu_entry = gsnedfbw_cpus[rt_cur->linked_on];
-			list_del_init(&rt_cur->standby_list);
-			if (cpu_entry->cpu != cpu_to_preempt->cpu)
-			{
-				raw_spin_lock(&gsnedfbw_bw_lock);
-				unlock_bw_partitions(cpu_entry->cpu, tsk_rt(tsk_cur)->job_params.bw_partitions, &gsnedfbw);
-				tsk_rt(cpu_entry->linked)->job_params.bw_partitions = 0;
-				raw_spin_unlock(&gsnedfbw_bw_lock);
-				/* requeue the linked task; scheduled task is requeued at schedule() */
-				if (requeue_preempted_job(cpu_entry->linked))
-					requeue(cpu_entry->linked);
-				link_task_to_cpu(NULL, cpu_entry);
-				cpu_entry->preempting = task;
-				preempt(cpu_entry);
-			}
-		}
-		INIT_LIST_HEAD(&tsk_rt(&standby_tasks)->standby_list);
-	}
-	/* Link task and preempt the cpu_to_preempt */
-	/* The preempted CPU may be preempted by bandwidth or CPU only
- 	 * Must be executed in both situation
- 	 * Otherwise will fail to link the task and the task will never be scheduled
- 	 * NOTE: We must requeue the preempted task on preempted CPU, otherwise,
- 	 * scheduler will lose track of the preempted task.
- 	 * Unless task voluntarily yield CPU by finishing its job,
- 	 * preempting CPU has the responsibility to add preempted task back to
- 	 * ready_queue since preempted task must be runnable 
- 	 * BUG FIX: A RT task may be preempted only by CPU when system has enough
- 	 * free bandwidth! Preempting task take free bandwidth, release bandwidth of
- 	 * preempted task AND requeue the preempted task */
-	if (cpu_to_preempt->linked && is_realtime(cpu_to_preempt->linked))
-	{
-//		raw_spin_lock(&gsnedfbw_bw_lock);
-//		unlock_bw_partitions(cpu_to_preempt->cpu, tsk_rt(cpu_to_preempt->linked)->job_params.bw_partitions, &gsnedfbw);
-//		tsk_rt(cpu_to_preempt->linked)->job_params.bw_partitions = 0;
-//		raw_spin_unlock(&gsnedfbw_bw_lock);
-		if (requeue_preempted_job(cpu_to_preempt->linked))
-			requeue(cpu_to_preempt->linked);
 	}
 
-	/* Set up the preempting task and invoke schedule on preempted CPU */
-	/* Always link preempting task to cpu_to_preempt */
-	link_task_to_cpu(task, cpu_to_preempt);
-	if (count_set_bits(bw_mask_to_use) != tsk_rt(task)->task_params.num_bw_partitions)
+	if (bw_ok)
 	{
-		TRACE_TASK(task, "[BUG] bw_mask_to_use=0x%x bits num != task.num_bw %d\n",
-				   bw_mask_to_use, tsk_rt(task)->task_params.num_bw_partitions);
+		tsk_rt(task)->job_params.bw_partitions = bw_mask_to_use;
+		raw_spin_lock(&gsnedfbw_bw_lock);
+		lock_bw_partitions(entry->cpu, tsk_rt(task)->job_params.bw_partitions, task, &gsnedfbw);
+		raw_spin_unlock(&gsnedfbw_bw_lock);
 	}
-	tsk_rt(task)->job_params.bw_partitions = (bw_mask_to_use & BANDWIDTH_PARTITIONS_MASK);
-//	raw_spin_lock(&gsnedfbw_bw_lock);
-//	lock_bw_partitions(cpu_to_preempt->cpu, tsk_rt(cpu_to_preempt->linked)->job_params.bw_partitions, cpu_to_preempt->linked, &gsnedfbw);
-//	raw_spin_unlock(&gsnedfbw_bw_lock);
-	TRACE_TASK(task, "To preempt CPU %d, bw_ok=%d, cpu_ok=%d, job.bw_mask=0x%x, rt.used_bw_mask=0x%x\n",
-			   cpu_to_preempt->cpu, bw_ok, cpu_ok, tsk_rt(task)->job_params.bw_partitions, rt->used_bw_partitions);
-	preempt(cpu_to_preempt);
- out:
-	return has_preemption;
+
+	return bw_ok;
 }
 
-/* check_for_preemptions for all possible CPUs for GSN-EDFBW */
+/* check for any necessary preemptions */
 static void check_for_preemptions(void)
 {
-	int has_preemption = SCHED_NO_PREEMPTION;
-	int num_preemption = 0;
-//	int num_blocked_hi_tasks = 0;
-//	struct task_struct *cur;
-//	struct task_struct blocked_hi_tasks;
-//	struct list_head *iter, *tmp;
+	struct task_struct *task;
+	cpu_entry_t *last;
+	int ret = 0;
 
-	//INIT_LIST_HEAD(&tsk_rt(&blocked_hi_tasks)->standby_list);
+#ifdef CONFIG_PREFER_LOCAL_LINKING
+	cpu_entry_t *local;
 
-	do {
-		has_preemption = check_for_preemptions_helper();
-		if (has_preemption == SCHED_HAS_PREEMPTION || SCHED_NO_PREEMPTION)
-			num_preemption++;
-		if (has_preemption == SCHED_NO_LOW_PRIO_CORE)
-			break;
-//		if (has_preemption == SCHED_NO_PREEMPTION)
-//		{
-//			/* Highest priority task in ready queue cannot preempt
-// 			 * Save it to blocked_hi_tasks and try the next one in
-// 			 * ready_queue */
-//			cur = __take_ready(&gsnedfbw);
-//			if (!cur)
-//				break;
-//			if (!list_empty(&tsk_rt(cur)->standby_list))
-//			{
-//				TRACE_TASK(cur, "[BUG] going to have corrupted standby_list\n");
-//			}
-//			list_add(&tsk_rt(cur)->standby_list, &tsk_rt(&blocked_hi_tasks)->standby_list);
-//			++num_blocked_hi_tasks;
-//			TRACE_TASK(cur, "%dth high priority task cannot preempt, try lower priority ready task.\n", num_blocked_hi_tasks);
-//		}
-	} while (num_preemption <= NR_CPUS);
+	/* Before linking to other CPUs, check first whether the local CPU is
+	 * idle. */
+	local = this_cpu_ptr(&gsnedfbw_cpu_entries);
+	task  = __peek_ready(&gsnedfbw);
 
-	if (num_preemption == NR_CPUS + 1)
-	{
-		TRACE("[BUG] ready_queue is not sorted properly.\n");
+	if (task && !local->linked
+#ifdef CONFIG_RELEASE_MASTER
+	    && likely(local->cpu != gsnedfbw.release_master)
+#endif
+		) {
+		task = __take_ready(&gsnedfbw);
+		TRACE_TASK(task, "linking to local CPU %d to avoid IPI\n", local->cpu);
+
+		ret = check_for_bw_preemptions(local, task);
+
+		if (ret != 0)
+		{
+			link_task_to_cpu(task, local);
+			preempt(local);
+		}
 	}
-//	if (num_blocked_hi_tasks == 0)
-//		return;
+#endif
 
-//	list_for_each_safe(iter, tmp, &tsk_rt(&blocked_hi_tasks)->standby_list) {
-//			struct rt_param *rt_cur = list_entry(iter, struct rt_param, standby_list);
-//			struct task_struct *tsk_cur = list_entry(rt_cur, struct task_struct, rt_param); /* correct */
-//			list_del_init(&rt_cur->standby_list);
-//			__add_ready(&gsnedfbw, tsk_cur);
-//	}
+	for (last = lowest_prio_cpu();
+	     edf_preemption_needed(&gsnedfbw, last->linked);
+	     last = lowest_prio_cpu()) {
+		/* preemption necessary */
+		task = __take_ready(&gsnedfbw);
+		TRACE("check_for_preemptions: attempting to link task %d to %d\n",
+		      task->pid, last->cpu);
 
-	return;
+#ifdef CONFIG_SCHED_CPU_AFFINITY
+		{
+			cpu_entry_t *affinity =
+					gsnedfbw_get_nearest_available_cpu(
+						&per_cpu(gsnedfbw_cpu_entries, task_cpu(task)));
+			if (affinity)
+				last = affinity;
+			else if (requeue_preempted_job(last->linked))
+				requeue(last->linked);
+		}
+#else
+		if (requeue_preempted_job(last->linked))
+			requeue(last->linked);
+#endif
+
+		ret = check_for_bw_preemptions(last, task);
+
+		if (ret != 0)
+		{
+			link_task_to_cpu(task, last);
+			preempt(last);
+		}
+	}
 }
 
 /* gsnedfbw_job_arrival: task is either resumed or released */
@@ -676,7 +584,7 @@ static void gsnedfbw_release_jobs(rt_domain_t* rt, struct bheap* tasks)
 {
 	unsigned long flags;
 
-	TRACE("gsnfpca_release_jobs\n");
+	TRACE("gsnedfbw_release_jobs\n");
 	raw_spin_lock_irqsave(&gsnedfbw_lock, flags);
 
 	__merge_ready(rt, tasks);
@@ -695,9 +603,9 @@ static noinline void curr_job_completion(int forced)
 
 	TRACE_TASK(t, "job_completion(forced=%d).\n", forced);
 
-	raw_spin_lock(&gsnedfbw_bw_lock);
-	unlock_bw_partitions(tsk_rt(t)->scheduled_on, tsk_rt(t)->job_params.bw_partitions, &gsnedfbw);
-	raw_spin_unlock(&gsnedfbw_bw_lock);
+//	raw_spin_lock(&gsnedfbw_bw_lock);
+//	unlock_bw_partitions(tsk_rt(t)->scheduled_on, tsk_rt(t)->job_params.bw_partitions, &gsnedfbw);
+//	raw_spin_unlock(&gsnedfbw_bw_lock);
 
 	/* set flags */
 	tsk_rt(t)->completed = 0;
@@ -910,7 +818,6 @@ static struct task_struct* gsnedfbw_schedule(struct task_struct * prev)
 			/* not gonna be scheduled soon */
 			entry->scheduled->rt_param.scheduled_on = NO_CPU;
 			tsk_rt(entry->scheduled)->job_params.bw_partitions = 0;
-			/* No need to set job_params.bw_partitions to 0 because bw_state has indicated that. */
 			TRACE_TASK(entry->scheduled, "scheduled_on = NO_CPU, rt->used_bw_mask=0x%x should exclude job.bw_mask=0x%x\n",
 					   rt->used_bw_partitions, entry->scheduled->rt_param.job_params.bw_partitions);
 			/* Trace when preempted via bandwidth by another CPU */
@@ -950,7 +857,7 @@ static struct task_struct* gsnedfbw_schedule(struct task_struct * prev)
 	raw_spin_unlock(&gsnedfbw_lock);
 
 #ifdef WANT_ALL_SCHED_EVENTS
-	TRACE_TASK(next, "gsnfpca_lock released\n");
+	TRACE_TASK(next, "gsnedfbw_lock released\n");
 
 	if (next)
 		TRACE_TASK(next, "scheduled at %llu\n", litmus_clock());
@@ -964,33 +871,15 @@ static struct task_struct* gsnedfbw_schedule(struct task_struct * prev)
 
 }
 
-
 /* _finish_switch - we just finished the switch away from prev
  */
 static void gsnedfbw_finish_switch(struct task_struct *prev)
 {
 	cpu_entry_t *entry = this_cpu_ptr(&gsnedfbw_cpu_entries);
-//	rt_domain_t *rt = &gsnedfbw;
 
 	entry->scheduled = is_realtime(current) ? current : NULL;
-	TRACE_TASK(current, "switched to \n");
-//	if (is_realtime(current))
-//	{
-//		if (count_set_bits(tsk_rt(current)->job_params.bw_partitions) == 0)
-//		{
-//			int ret = 0;
-//	        raw_spin_lock(&gsnedfbw_bw_lock);
-//            unlock_bw_partitions(entry->cpu, tsk_rt(current)->job_params.bw_partitions, rt);
-//	        raw_spin_unlock(&gsnedfbw_bw_lock);
-//		}
-//		if (count_set_bits(tsk_rt(current)->job_params.bw_partitions) == tsk_rt(current)->task_params.num_bw_partitions)
-//		{
-//	        raw_spin_lock(&gsnedfbw_bw_lock);
-//			lock_bw_partitions(entry->cpu, tsk_rt(current)->job_params.bw_partitions, rt);
-//	        raw_spin_unlock(&gsnedfbw_bw_lock);
-//        }
-//	}
 #ifdef WANT_ALL_SCHED_EVENTS
+	TRACE_TASK(current, "switched to \n");
 	TRACE_TASK(prev, "switched away from\n");
 #endif
 }
@@ -1161,6 +1050,7 @@ static long gsnedfbw_activate_plugin(void)
 {
 	int cpu;
 	cpu_entry_t *entry;
+	cpu_bw_entry_t *bw_entry;
 
 	bheap_init(&gsnedfbw_cpu_heap);
 #ifdef CONFIG_RELEASE_MASTER
@@ -1172,6 +1062,9 @@ static long gsnedfbw_activate_plugin(void)
 		bheap_node_init(&entry->hn, entry);
 		entry->linked    = NULL;
 		entry->scheduled = NULL;
+		bw_entry = &per_cpu(cpu_bw_entries, cpu);
+		bw_entry->cpu = cpu;
+		bw_entry->used_bw = 0;
 #ifdef CONFIG_RELEASE_MASTER
 		if (cpu != gsnedfbw.release_master) {
 #endif
@@ -1218,7 +1111,7 @@ static struct sched_plugin gsn_edfbw_plugin __cacheline_aligned_in_smp = {
 
 static int __init init_gsn_edfbw(void)
 {
-	int cpu,bw;
+	int cpu;
 	cpu_entry_t *entry;
 	cpu_bw_entry_t *bw_entry;
 
@@ -1243,20 +1136,6 @@ static int __init init_gsn_edfbw(void)
 
 	gsnedfbw.used_bw_partitions = 0;
 	memset(gsnedfbw.bw2taskmap, 0, sizeof(gsnedfbw.bw2taskmap));
-
-	for (cpu = 0; cpu < NR_CPUS; cpu++)  {
-		entry = &per_cpu(gsnedfbw_cpu_entries, cpu);
-		gsnedfbw_cpus[cpu] = entry;
-		standby_cpus[cpu] = 0;
-		entry->cpu 	 = cpu;
-		entry->hn        = &gsnedfbw_heap_node[cpu];
-		bheap_node_init(&entry->hn, entry);
-		bw_entry = &per_cpu(cpu_bw_entries, cpu);
-//		TRACE("[P%d] gsn_edfbw: cpu:%d->%d used_cpu:%d->0\n",
-//			  cpu, bw_entry->cpu, cpu, bw_entry->used_bw);
-		bw_entry->cpu = cpu;
-		bw_entry->used_bw = 0;
-	}
 
 	edf_domain_init(&gsnedfbw, NULL, gsnedfbw_release_jobs);
 	return register_sched_plugin(&gsn_edfbw_plugin);
