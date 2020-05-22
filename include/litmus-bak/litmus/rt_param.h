@@ -8,6 +8,15 @@
 /* Litmus time type. */
 typedef unsigned long long lt_t;
 
+/*
+typedef enum bw_state {
+	BW_INIT		= (1 << 0);
+	BW_WILL_USE		= (1 << 1),
+	BW_IN_USE		= (1 << 2),
+	BW_INVALID		= (1 << 3)
+}bw_state_t;
+*/
+
 static inline int lt_after(lt_t a, lt_t b)
 {
 	return ((long long) b) - ((long long) a) < 0;
@@ -121,7 +130,7 @@ struct rt_task {
 	lt_t 		period;
 	lt_t		relative_deadline;
 	lt_t		phase;
-	unsigned int	num_bw_partitions:0;
+	unsigned int	num_bw_partitions;
 	unsigned int	cpu;
 	unsigned int	priority;
 	task_class_t	cls;
@@ -164,7 +173,7 @@ struct rt_job {
 	/*
 	*
 	*/
-	uint32_t bw_partitions:0;
+	uint32_t bw_partitions;
 	unsigned int num_using_bw_partitions;
 
 #ifdef CONFIG_SCHED_TASK_TRACE

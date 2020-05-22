@@ -30,13 +30,13 @@ static inline int check_bw_status_invariant(int cpu, uint32_t bw_mask)
 	cpu_bw_entry_t *bw_entry_tmp, *bw_entry;
 	
 	bw_entry = &per_cpu(cpu_bw_entries, cpu);
-	for (i = 0; i < NR_CPUS; i++)
-	{
+
+	for_each_online_cpu(i) {
 		bw_entry_tmp = &per_cpu(cpu_bw_entries, i);
 		if (i != cpu && (bw_entry_tmp->used_bw & bw_mask))
 		{
-			TRACE("[BUG]Lock [P%d], Detect overlap BW: [P%d] used_bw:0x%x, [P%d] used_bw:0x%x",
-				   cpu, i, bw_entry_tmp->used_bw, cpu, bw_entry->used_bw);
+			TRACE("[BUG]Lock [P%d], Detect overlap BW: [P%d] used_bw:0x%x, [P%d] used_bw:0x%x, NR_CPUS=%d\n",
+				   cpu, i, bw_entry_tmp->used_bw, cpu, bw_entry->used_bw, NR_CPUS);
 			return 0;
 		}
 	}
@@ -67,7 +67,7 @@ void lock_bw_partitions(int cpu, uint32_t bw_mask, struct task_struct *tsk, rt_d
 		bw_entry = &per_cpu(cpu_bw_entries, cpu);
 		if (bw_entry->used_bw != 0)
 		{
-			TRACE("[BUG][P%d] has locked bw 0x%x before try to lock cbwp 0x%x\n",
+			TRACE("[BUG][P%d] has locked bw 0x%x before try to lock bw 0x%x\n",
 				  bw_entry->cpu, bw_entry->used_bw, bw_mask);
 		}
 		ret = check_bw_status_invariant(cpu, bw_mask);
@@ -81,6 +81,7 @@ void lock_bw_partitions(int cpu, uint32_t bw_mask, struct task_struct *tsk, rt_d
 					rt->bw2taskmap[i] = tsk->pid;
 				}
 			}
+			rt->used_bw_partitions |= bw_mask;
 		//}
 	}
 	return;
@@ -114,6 +115,7 @@ void unlock_bw_partitions(int cpu, uint32_t bw_mask, rt_domain_t *rt)
 			}
 		}
 		bw_entry->used_bw = 0;
+		rt->used_bw_partitions &= (BANDWIDTH_PARTITIONS_MASK & ~bw_mask);
 	}
 
 	return;
