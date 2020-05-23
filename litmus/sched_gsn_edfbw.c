@@ -546,7 +546,8 @@ static void check_for_preemptions(void)
 			task = __take_ready(&gsnedfbw);
 			link_task_to_cpu(task, last);
 			preempt(last);
-		}
+		} else
+			break;
 	}
 }
 
