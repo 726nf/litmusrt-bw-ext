@@ -441,17 +441,20 @@ static int check_for_bw_preemptions(cpu_entry_t *entry, struct task_struct *task
 					TRACE("release gsnedfbw_bw_lock\n");
 					raw_spin_unlock(&gsnedfbw_bw_lock);
 
-					/* requeue the linked task; scheduled task is requeued at schedule() */
-					if (requeue_preempted_job(cpu_entry->linked))
-						requeue(cpu_entry->linked);
-					link_task_to_cpu(NULL, cpu_entry);
-					cpu_entry->preempting = task;
+					if (cpu_entry->cpu != entry->cpu)
+					{
+						/* requeue the linked task; scheduled task is requeued at schedule() */
+						if (requeue_preempted_job(cpu_entry->linked))
+							requeue(cpu_entry->linked);
+						link_task_to_cpu(NULL, cpu_entry);
+						cpu_entry->preempting = task;
+					}
 				}
 			}
+
 			TRACE_TASK(task, "Enough idle bandwidth through preemption, bw_ok=%d, bw_mask_to_use=0x%x, cpu=%d\n",
 					bw_ok, bw_mask_to_use, entry->cpu);
 			//INIT_LIST_HEAD(&tsk_rt(&standby_tasks)->standby_list);
-			INIT_LIST_HEAD(&tsk_rt(task)->standby_list);
 		}
 
 		for_each_online_cpu(cpu)
@@ -461,11 +464,18 @@ static int check_for_bw_preemptions(cpu_entry_t *entry, struct task_struct *task
 		}
 
 		memset(&standby_cpus, 0, sizeof(standby_cpus));
+		INIT_LIST_HEAD(&tsk_rt(task)->standby_list);
 	}
 
 	if (bw_ok)
 	{
 		tsk_rt(task)->job_params.bw_partitions = bw_mask_to_use;
+
+		if (entry->linked && is_realtime(entry->linked))
+		{
+			if (requeue_preempted_job(entry->linked))
+				requeue(entry->linked);
+		}
 
 		TRACE("asking for gsnedfbw_bw_lock\n");
 		raw_spin_lock(&gsnedfbw_bw_lock);
@@ -531,12 +541,12 @@ static void check_for_preemptions(void)
 						&per_cpu(gsnedfbw_cpu_entries, task_cpu(task)));
 			if (affinity)
 				last = affinity;
-			else if (requeue_preempted_job(last->linked))
-				requeue(last->linked);
+//			else if (requeue_preempted_job(last->linked))
+//				requeue(last->linked);
 		}
-#else
-		if (requeue_preempted_job(last->linked))
-			requeue(last->linked);
+//#else
+//		if (requeue_preempted_job(last->linked))
+//			requeue(last->linked);
 #endif
 
 		ret = check_for_bw_preemptions(last, task);
