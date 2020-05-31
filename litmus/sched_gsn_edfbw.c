@@ -127,7 +127,6 @@ static rt_domain_t gsnedfbw;
 #define gsnedfbw_lock (gsnedfbw.ready_lock)
 #define gsnedfbw_bw_lock (gsnedfbw.bw_lock)
 
-//static struct task_struct standby_tasks;
 static cpu_entry_t* standby_cpus[NR_CPUS];
 
 /* Uncomment this if you want to see all scheduling decisions in the
@@ -312,7 +311,6 @@ static int check_for_bw_preemptions(cpu_entry_t *entry, struct task_struct *task
 	rt_domain_t *rt = &gsnedfbw;
 	struct list_head *iter, *tmp;
 
-	//INIT_LIST_HEAD(&tsk_rt(&standby_tasks)->standby_list);
 	INIT_LIST_HEAD(&tsk_rt(task)->standby_list);
 	num_used_bw_partitions = count_set_bits(rt->used_bw_partitions & BANDWIDTH_PARTITIONS_MASK);
 
@@ -412,7 +410,6 @@ static int check_for_bw_preemptions(cpu_entry_t *entry, struct task_struct *task
 				}
 			}
 
-			//list_add(&tsk_rt(cur)->standby_list, &tsk_rt(&standby_tasks)->standby_list);
 			list_add(&tsk_rt(cur)->standby_list, &tsk_rt(task)->standby_list);
 
 			if (num_bw_to_use >= tsk_rt(task)->task_params.num_bw_partitions)
@@ -432,13 +429,13 @@ static int check_for_bw_preemptions(cpu_entry_t *entry, struct task_struct *task
 					cpu_entry_t *cpu_entry = gsnedfbw_cpus[rt_cur->linked_on];
 					list_del_init(&rt_cur->standby_list);
 
-					TRACE("asking for gsnedfbw_bw_lock\n");
+					TRACE_TASK(task, "asking for gsnedfbw_bw_lock\n");
 					raw_spin_lock(&gsnedfbw_bw_lock);
 
 					unlock_bw_partitions(cpu_entry->cpu, tsk_rt(tsk_cur)->job_params.bw_partitions, &gsnedfbw);
 					tsk_rt(cpu_entry->linked)->job_params.bw_partitions = 0;
 
-					TRACE("release gsnedfbw_bw_lock\n");
+					TRACE_TASK(task, "release gsnedfbw_bw_lock\n");
 					raw_spin_unlock(&gsnedfbw_bw_lock);
 
 					if (cpu_entry->cpu != entry->cpu)
@@ -448,14 +445,19 @@ static int check_for_bw_preemptions(cpu_entry_t *entry, struct task_struct *task
 							requeue(cpu_entry->linked);
 						link_task_to_cpu(NULL, cpu_entry);
 						cpu_entry->preempting = task;
+						preempt(cpu_entry);
 					}
 				}
 			}
 
 			TRACE_TASK(task, "Enough idle bandwidth through preemption, bw_ok=%d, bw_mask_to_use=0x%x, cpu=%d\n",
 					bw_ok, bw_mask_to_use, entry->cpu);
-			//INIT_LIST_HEAD(&tsk_rt(&standby_tasks)->standby_list);
+		} else {
+			list_for_each_safe(iter, tmp, &tsk_rt(task)->standby_list) {
+				list_del_init(iter);
+			}
 		}
+
 
 		for_each_online_cpu(cpu)
 		{
@@ -510,7 +512,6 @@ static void check_for_preemptions(void)
 	    && likely(local->cpu != gsnedfbw.release_master)
 #endif
 		) {
-//		task = __peek_ready(&gsnedfbw);
 		TRACE_TASK(task, "linking to local CPU %d to avoid IPI\n", local->cpu);
 
 		ret = check_for_bw_preemptions(local, task);
@@ -541,12 +542,7 @@ static void check_for_preemptions(void)
 						&per_cpu(gsnedfbw_cpu_entries, task_cpu(task)));
 			if (affinity)
 				last = affinity;
-//			else if (requeue_preempted_job(last->linked))
-//				requeue(last->linked);
 		}
-//#else
-//		if (requeue_preempted_job(last->linked))
-//			requeue(last->linked);
 #endif
 
 		ret = check_for_bw_preemptions(last, task);
@@ -821,7 +817,6 @@ static struct task_struct* gsnedfbw_schedule(struct task_struct * prev)
 					TRACE_TASK(entry->scheduled, "preempted by %s/%d/%d due to bandwidth preemption\n",
 				   	       entry->preempting->comm, entry->preempting->pid,
 						   tsk_rt(entry->preempting)->job_params.job_no);
-					//gsnedfbw_task_block(entry->scheduled);
 					entry->preempting = NULL;
 				}
 			}
@@ -998,17 +993,10 @@ static void gsnedfbw_task_exit(struct task_struct * t)
 
 static long gsnedfbw_admit_task(struct task_struct* tsk)
 {
-//	if (litmus_is_valid_fixed_prio(get_priority(tsk)))
-//	{
 		INIT_LIST_HEAD(&tsk_rt(tsk)->standby_list);
     	TRACE_TASK(tsk, "is admitted, num_bw=%d, job.bw_mask=0x%x (should be 0x0)\n",
 				   tsk_rt(tsk)->task_params.num_bw_partitions, tsk_rt(tsk)->job_params.bw_partitions);
 		return 0;
-//	} else {
-//        TRACE_TASK(tsk, "is rejected\n");
-//        return -EINVAL;
-//	}
-//	return 0;
 }
 
 static struct domain_proc_info gsnedfbw_domain_proc_info;
@@ -1116,7 +1104,6 @@ static int __init init_gsn_edfbw(void)
 	cpu_entry_t *entry;
 	cpu_bw_entry_t *bw_entry;
 
-	//INIT_LIST_HEAD(&tsk_rt(&standby_tasks)->standby_list);
 	memset(&standby_cpus, 0, sizeof(standby_cpus));
 
 	bheap_init(&gsnedfbw_cpu_heap);
