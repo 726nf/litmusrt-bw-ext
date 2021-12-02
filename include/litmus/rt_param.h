@@ -164,7 +164,7 @@ struct rt_job {
 	/*
 	*
 	*/
-	uint32_t bw_partitions:0;
+	uint32_t bw_partitions;
 	unsigned int num_using_bw_partitions;
 
 #ifdef CONFIG_SCHED_TASK_TRACE
